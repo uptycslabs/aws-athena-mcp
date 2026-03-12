@@ -46,6 +46,7 @@ def create_server() -> FastMCP:
     print("   • run_query - Execute SQL queries")
     print("   • get_status - Check query status")
     print("   • get_result - Get query results")
+    print("   • list_databases - List all databases")
     print("   • list_tables - List database tables")
     print("   • describe_table - Get table schema")
 

@@ -17,6 +17,26 @@ def register_schema_tools(mcp: "FastMCP", athena_client: AthenaClient) -> None:
     """Register schema-related MCP tools."""
 
     @mcp.tool()
+    async def list_databases() -> str:
+        """
+        List all databases in the Athena catalog.
+
+        Returns:
+            JSON string with list of database names
+        """
+        try:
+            databases = await athena_client.list_databases()
+            return json.dumps({"databases": databases, "count": len(databases)}, indent=2)
+
+        except AthenaError as e:
+            return json.dumps(
+                {"error": e.message, "code": e.code, "query_execution_id": e.query_execution_id},
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e), "code": "INVALID_REQUEST"}, indent=2)
+
+    @mcp.tool()
     async def list_tables(database: str) -> str:
         """
         List all tables in the specified Athena database.
