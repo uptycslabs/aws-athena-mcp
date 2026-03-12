@@ -221,29 +221,47 @@ class AthenaClient:
                     query_execution_id,
                 )
 
-            # Get results
-            response = self.client.get_query_results(
-                QueryExecutionId=query_execution_id, MaxResults=max_rows
-            )
-
-            result_set = response.get("ResultSet", {})
-
-            # Extract columns
-            column_info = result_set.get("ResultSetMetadata", {}).get("ColumnInfo", [])
-            columns = [col.get("Name", "") for col in column_info]
-
-            # Extract rows (skip header for SELECT queries)
-            rows_data = result_set.get("Rows", [])
-            start_index = 1 if len(rows_data) > 0 and columns else 0
-
+            # Get results (paginate to respect AWS MaxResults limit of 1000)
+            columns = []
             rows = []
-            for row_data in rows_data[start_index:]:
-                row = {}
-                data_list = row_data.get("Data", [])
-                for i, data in enumerate(data_list):
-                    if i < len(columns):
-                        row[columns[i]] = data.get("VarCharValue")
-                rows.append(row)
+            next_token = None
+            is_first_page = True
+
+            while len(rows) < max_rows:
+                page_size = min(1000, max_rows - len(rows))
+                kwargs = {
+                    "QueryExecutionId": query_execution_id,
+                    "MaxResults": page_size,
+                }
+                if next_token:
+                    kwargs["NextToken"] = next_token
+
+                response = self.client.get_query_results(**kwargs)
+                result_set = response.get("ResultSet", {})
+
+                # Extract columns from first page
+                if is_first_page:
+                    column_info = result_set.get("ResultSetMetadata", {}).get("ColumnInfo", [])
+                    columns = [col.get("Name", "") for col in column_info]
+
+                rows_data = result_set.get("Rows", [])
+                # Skip header row on first page for SELECT queries
+                start_index = 1 if is_first_page and len(rows_data) > 0 and columns else 0
+                is_first_page = False
+
+                for row_data in rows_data[start_index:]:
+                    if len(rows) >= max_rows:
+                        break
+                    row = {}
+                    data_list = row_data.get("Data", [])
+                    for i, data in enumerate(data_list):
+                        if i < len(columns):
+                            row[columns[i]] = data.get("VarCharValue")
+                    rows.append(row)
+
+                next_token = response.get("NextToken")
+                if not next_token:
+                    break
 
             result = QueryResult(
                 query_execution_id=query_execution_id,
@@ -260,6 +278,21 @@ class AthenaClient:
             error_code = e.response.get("Error", {}).get("Code", "UNKNOWN")
             logger.error(f"Error getting query results: {error_code} - {str(e)}")
             raise AthenaError(str(e), error_code, query_execution_id)
+
+    async def list_databases(self) -> list[str]:
+        """List all databases in the Athena catalog."""
+        logger.info("Listing databases")
+
+        request = QueryRequest(database="default", query="SHOW DATABASES", max_rows=1000)
+        result = await self.execute_query(request)
+
+        if isinstance(result, str):
+            logger.error("SHOW DATABASES query timed out")
+            raise AthenaError("SHOW DATABASES query timed out", "TIMEOUT", result)
+
+        databases = [row.get("database_name", "") for row in result.rows if "database_name" in row]
+        logger.info(f"Found {len(databases)} databases")
+        return databases
 
     async def list_tables(self, database: str) -> DatabaseInfo:
         """List all tables in a database."""
