@@ -34,6 +34,7 @@ class QueryResult(BaseModel):
     query_execution_id: str
     columns: List[str]
     rows: List[Dict[str, Any]]
+    row_count: int = 0
     bytes_scanned: int = 0
     execution_time_ms: int = 0
 

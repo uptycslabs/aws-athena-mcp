@@ -8,7 +8,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import boto3
 from botocore.exceptions import ClientError
@@ -36,16 +36,14 @@ class QueryValidator:
     """Validates and sanitizes SQL queries to prevent injection attacks."""
 
     # Dangerous SQL patterns that should be blocked
+    # Note: Athena is read-only and IAM-controlled, so we only block
+    # truly dangerous patterns (multi-statement injection, command execution).
+    # Legitimate patterns like information_schema, UNION SELECT, and SQL
+    # comments are allowed as they are valid Athena usage.
     DANGEROUS_PATTERNS = [
         r";\s*(drop|delete|truncate|alter|create|insert|update)\s+",
-        r"--\s*",  # SQL comments
-        r"/\*.*?\*/",  # Multi-line comments
         r"xp_cmdshell",  # Command execution
         r"sp_executesql",  # Dynamic SQL execution
-        r"exec\s*\(",  # Execute statements
-        r"union\s+.*select",  # Union-based injection
-        r"information_schema",  # Schema information access
-        r"sys\.",  # System table access
     ]
 
     @classmethod
@@ -111,20 +109,56 @@ class AthenaClient:
 
     def __init__(self, config: Config):
         self.config = config
+        self._default_client = None
 
-        # Initialize boto3 client
-        session = boto3.Session(region_name=config.aws_region)
-        self.client = session.client("athena")
+        # Only create a default client if we have default credentials
+        if not config.no_default_creds:
+            self._default_client = self._create_client(config)
 
-        logger.info(f"Initialized Athena client for region: {config.aws_region}")
+        logger.info(
+            f"Initialized Athena client for region: {config.aws_region}, "
+            f"no_default_creds: {config.no_default_creds}"
+        )
 
-    async def execute_query(self, request: QueryRequest) -> Union[QueryResult, str]:
+    @staticmethod
+    def _create_client(config: Config):
+        """Create a boto3 Athena client from config."""
+        session_kwargs = {"region_name": config.aws_region}
+
+        # Use per-call credentials if provided
+        if config.aws_access_key_id and config.aws_secret_access_key:
+            session_kwargs["aws_access_key_id"] = config.aws_access_key_id
+            session_kwargs["aws_secret_access_key"] = config.aws_secret_access_key
+            if config.aws_session_token:
+                session_kwargs["aws_session_token"] = config.aws_session_token
+
+        session = boto3.Session(**session_kwargs)
+        return session.client("athena")
+
+    def _get_client(self, config: Optional[Config] = None):
+        """Get the appropriate boto3 client for this call."""
+        if config and (config.aws_access_key_id and config.aws_secret_access_key):
+            return self._create_client(config)
+        if self._default_client:
+            return self._default_client
+        raise AthenaError(
+            "No AWS credentials available. Either provide per-call credentials "
+            "or start the server without --no-default-creds.",
+            "NO_CREDENTIALS",
+        )
+
+    async def execute_query(
+        self, request: QueryRequest, call_config: Optional[Config] = None
+    ) -> Union[QueryResult, str]:
         """
         Execute a query and return results or execution ID if timeout.
 
         Returns:
             QueryResult if completed within timeout, otherwise query_execution_id string
         """
+        config = call_config or self.config
+        client = self._get_client(call_config)
+
         logger.info(f"Executing query in database: {request.database}")
         logger.debug(f"Query: {request.query[:200]}...")  # Log first 200 chars
 
@@ -137,23 +171,25 @@ class AthenaClient:
             start_params = {
                 "QueryString": request.query,
                 "QueryExecutionContext": {"Database": sanitized_database},
-                "ResultConfiguration": {"OutputLocation": self.config.s3_output_location},
+                "ResultConfiguration": {"OutputLocation": config.s3_output_location},
             }
 
-            if self.config.athena_workgroup:
-                start_params["WorkGroup"] = self.config.athena_workgroup
-                logger.debug(f"Using workgroup: {self.config.athena_workgroup}")
+            if config.athena_workgroup:
+                start_params["WorkGroup"] = config.athena_workgroup
+                logger.debug(f"Using workgroup: {config.athena_workgroup}")
 
-            response = self.client.start_query_execution(**start_params)
+            response = await asyncio.to_thread(
+                client.start_query_execution, **start_params
+            )
             query_execution_id = response["QueryExecutionId"]
 
             logger.info(f"Started query execution: {query_execution_id}")
 
             # Wait for completion with timeout
-            if await self._wait_for_completion(query_execution_id):
+            if await self._wait_for_completion(query_execution_id, client, config):
                 logger.info(f"Query completed successfully: {query_execution_id}")
                 query_result: QueryResult = await self.get_query_results(
-                    query_execution_id, request.max_rows
+                    query_execution_id, request.max_rows, call_config
                 )
                 return query_result
             else:
@@ -170,12 +206,17 @@ class AthenaClient:
             logger.error(f"Unexpected error during query execution: {str(e)}")
             raise
 
-    async def get_query_status(self, query_execution_id: str) -> QueryStatus:
+    async def get_query_status(
+        self, query_execution_id: str, call_config: Optional[Config] = None
+    ) -> QueryStatus:
         """Get the status of a query execution."""
+        client = self._get_client(call_config)
         logger.debug(f"Getting status for query: {query_execution_id}")
 
         try:
-            response = self.client.get_query_execution(QueryExecutionId=query_execution_id)
+            response = await asyncio.to_thread(
+                client.get_query_execution, QueryExecutionId=query_execution_id
+            )
             execution = response.get("QueryExecution", {})
 
             status = execution.get("Status", {})
@@ -197,13 +238,16 @@ class AthenaClient:
             logger.error(f"Error getting query status: {error_code} - {str(e)}")
             raise AthenaError(str(e), error_code, query_execution_id)
 
-    async def get_query_results(self, query_execution_id: str, max_rows: int = 1000) -> QueryResult:
+    async def get_query_results(
+        self, query_execution_id: str, max_rows: int = 1000, call_config: Optional[Config] = None
+    ) -> QueryResult:
         """Get results for a completed query."""
+        client = self._get_client(call_config)
         logger.info(f"Getting results for query: {query_execution_id}, max_rows: {max_rows}")
 
         try:
             # Check status first
-            status = await self.get_query_status(query_execution_id)
+            status = await self.get_query_status(query_execution_id, call_config)
 
             if status.state in [QueryState.RUNNING, QueryState.QUEUED]:
                 raise AthenaError("Query is still running", "QUERY_RUNNING", query_execution_id)
@@ -221,34 +265,58 @@ class AthenaClient:
                     query_execution_id,
                 )
 
-            # Get results
-            response = self.client.get_query_results(
-                QueryExecutionId=query_execution_id, MaxResults=max_rows
-            )
-
-            result_set = response.get("ResultSet", {})
-
-            # Extract columns
-            column_info = result_set.get("ResultSetMetadata", {}).get("ColumnInfo", [])
-            columns = [col.get("Name", "") for col in column_info]
-
-            # Extract rows (skip header for SELECT queries)
-            rows_data = result_set.get("Rows", [])
-            start_index = 1 if len(rows_data) > 0 and columns else 0
-
+            # Get results with pagination support
+            # Athena API returns max 1000 rows per call, so paginate if needed
+            columns = []
             rows = []
-            for row_data in rows_data[start_index:]:
-                row = {}
-                data_list = row_data.get("Data", [])
-                for i, data in enumerate(data_list):
-                    if i < len(columns):
-                        row[columns[i]] = data.get("VarCharValue")
-                rows.append(row)
+            next_token = None
+            is_first_page = True
+
+            while len(rows) < max_rows:
+                # Account for header row on first page, but never exceed API limit of 1000
+                page_size = min(max_rows - len(rows), 999 if is_first_page else 1000)
+                get_params = {
+                    "QueryExecutionId": query_execution_id,
+                    "MaxResults": page_size + (1 if is_first_page else 0),  # +1 for header on first page
+                }
+                if next_token:
+                    get_params["NextToken"] = next_token
+
+                response = await asyncio.to_thread(
+                    client.get_query_results, **get_params
+                )
+
+                result_set = response.get("ResultSet", {})
+
+                # Extract columns from first page only
+                if is_first_page:
+                    column_info = result_set.get("ResultSetMetadata", {}).get("ColumnInfo", [])
+                    columns = [col.get("Name", "") for col in column_info]
+
+                # Extract rows (skip header on first page for SELECT queries)
+                rows_data = result_set.get("Rows", [])
+                start_index = 1 if is_first_page and len(rows_data) > 0 and columns else 0
+
+                for row_data in rows_data[start_index:]:
+                    if len(rows) >= max_rows:
+                        break
+                    row = {}
+                    data_list = row_data.get("Data", [])
+                    for i, data in enumerate(data_list):
+                        if i < len(columns):
+                            row[columns[i]] = data.get("VarCharValue")
+                    rows.append(row)
+
+                is_first_page = False
+                next_token = response.get("NextToken")
+                if not next_token:
+                    break
 
             result = QueryResult(
                 query_execution_id=query_execution_id,
                 columns=columns,
                 rows=rows,
+                row_count=len(rows),
                 bytes_scanned=status.bytes_scanned,
                 execution_time_ms=status.execution_time_ms,
             )
@@ -261,7 +329,32 @@ class AthenaClient:
             logger.error(f"Error getting query results: {error_code} - {str(e)}")
             raise AthenaError(str(e), error_code, query_execution_id)
 
-    async def list_tables(self, database: str) -> DatabaseInfo:
+    async def list_databases(self, call_config: Optional[Config] = None) -> List[str]:
+        """List all databases in the Athena catalog."""
+        client = self._get_client(call_config)
+        logger.info("Listing databases")
+
+        try:
+            def _list_databases():
+                databases = []
+                paginator = client.get_paginator("list_databases")
+                for page in paginator.paginate(CatalogName="AwsDataCatalog"):
+                    for db in page.get("DatabaseList", []):
+                        databases.append(db.get("Name", ""))
+                return sorted(databases)
+
+            databases = await asyncio.to_thread(_list_databases)
+            logger.info(f"Found {len(databases)} databases")
+            return databases
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "UNKNOWN")
+            logger.error(f"Error listing databases: {error_code} - {str(e)}")
+            raise AthenaError(str(e), error_code)
+
+    async def list_tables(
+        self, database: str, call_config: Optional[Config] = None
+    ) -> DatabaseInfo:
         """List all tables in a database."""
         logger.info(f"Listing tables in database: {database}")
 
@@ -269,7 +362,7 @@ class AthenaClient:
 
         request = QueryRequest(database=sanitized_database, query="SHOW TABLES", max_rows=1000)
 
-        result = await self.execute_query(request)
+        result = await self.execute_query(request, call_config)
 
         if isinstance(result, str):
             # Query timed out
@@ -286,7 +379,9 @@ class AthenaClient:
         logger.info(f"Found {len(tables)} tables in database: {database}")
         return database_info
 
-    async def describe_table(self, database: str, table_name: str) -> TableInfo:
+    async def describe_table(
+        self, database: str, table_name: str, call_config: Optional[Config] = None
+    ) -> TableInfo:
         """Get schema information for a specific table."""
         logger.info(f"Describing table: {database}.{table_name}")
 
@@ -297,7 +392,7 @@ class AthenaClient:
             database=sanitized_database, query=f"DESCRIBE {sanitized_table}", max_rows=1000
         )
 
-        result = await self.execute_query(request)
+        result = await self.execute_query(request, call_config)
 
         if isinstance(result, str):
             # Query timed out
@@ -322,14 +417,19 @@ class AthenaClient:
         logger.info(f"Described table {database}.{table_name} with {len(columns)} columns")
         return table_info
 
-    async def _wait_for_completion(self, query_execution_id: str) -> bool:
+    async def _wait_for_completion(
+        self, query_execution_id: str, client=None, config: Optional[Config] = None
+    ) -> bool:
         """
         Wait for query completion with timeout.
 
         Returns:
             True if completed successfully, False if timed out
         """
-        timeout_seconds = self.config.timeout_seconds
+        cfg = config or self.config
+        if client is None:
+            client = self._get_client()
+        timeout_seconds = cfg.timeout_seconds
         start_time = time.time()
 
         logger.debug(
@@ -338,7 +438,9 @@ class AthenaClient:
 
         while time.time() - start_time < timeout_seconds:
             try:
-                response = self.client.get_query_execution(QueryExecutionId=query_execution_id)
+                response = await asyncio.to_thread(
+                    client.get_query_execution, QueryExecutionId=query_execution_id
+                )
                 state = response.get("QueryExecution", {}).get("Status", {}).get("State")
 
                 if state == QueryState.SUCCEEDED:
